@@ -1,0 +1,179 @@
+name: Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Build config
+        required: false
+        default: Release
+        type: choice
+        options: [Release, Debug]
+      api_id:
+        description: TDESKTOP_API_ID
+        required: false
+        default: "2040"
+      api_hash:
+        description: TDESKTOP_API_HASH
+        required: false
+        default: b18441a1ff607e10a989891a5462e627
+  push:
+    branches: [dev]
+    paths:
+      - "Telegram/**"
+      - "cmake/**"
+      - ".github/workflows/linux.yml"
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ inputs.config || 'Release' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CONFIG: ${{ inputs.config || 'Release' }}
+      API_ID: ${{ inputs.api_id || '2040' }}
+      API_HASH: ${{ inputs.api_hash || 'b18441a1ff607e10a989891a5462e627' }}
+      IMAGE_TAR: /mnt/cache/centos_env.tar
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          # Keep the pre-installed 4GB swap as an OOM cushion for Qt compiles.
+          swap-storage: false
+
+      - name: Relocate Docker storage to /mnt
+        run: |
+          set -eux
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo mkdir -p /mnt/docker
+          if [ -d /var/lib/docker ]; then
+            sudo rsync -aHAX --remove-source-files /var/lib/docker/ /mnt/docker/ || true
+            sudo rm -rf /var/lib/docker
+          fi
+          sudo ln -s /mnt/docker /var/lib/docker
+          # /mnt itself is root-owned; create a runner-writable subdir so
+          # `docker save -o /mnt/cache/...` (non-sudo) can write its temp file.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 /mnt/cache
+          sudo systemctl start containerd docker
+          docker info | grep -E "Docker Root Dir|Storage Driver" || true
+          df -h / /mnt
+
+      - name: Add extra swap on /mnt
+        # Qt6 / qtdeclarative builds can peak >2GB per compile and OOM-kill
+        # buildkitd. ubuntu-latest only has 16GB RAM; add 8GB of swap on the
+        # roomy /mnt disk as a buffer.
+        run: |
+          set -eux
+          sudo fallocate -l 8G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          sudo sysctl vm.swappiness=10
+          free -h
+          swapon --show
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Restore centos_env image cache
+        id: img-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.IMAGE_TAR }}
+          # Bust whenever the Dockerfile template, gen script, poetry lock,
+          # or prepare/linux.sh changes.
+          key: centos_env-v1-${{ hashFiles('Telegram/build/docker/centos_env/**', 'Telegram/build/prepare/linux.sh') }}
+
+      - name: Build centos_env image via linux.sh
+        if: steps.img-cache.outputs.cache-hit != 'true'
+        # gen_dockerfile.py reads these env vars (empty string = False):
+        #   JOBS=2  caps CMAKE_BUILD_PARALLEL_LEVEL so Qt/FFmpeg compiles
+        #           don't trigger OOM on the 16GB runner.
+        #   LTO=""  disables -flto=auto -ffat-lto-objects in deps. LTO link
+        #           of Qt6 on GCC 15 peaks at 4-6GB/process and routinely
+        #           ICEs or gets OOM-killed on stock GHA runners.
+        #   DEBUG="" drops -g from dep CFLAGS, shrinking static .a sizes
+        #           ~3x and cutting compile RAM accordingly.
+        env:
+          JOBS: "2"
+          LTO: ""
+          DEBUG: ""
+        run: |
+          set -eux
+          ./Telegram/build/prepare/linux.sh
+          docker image ls tdesktop:centos_env
+          docker save tdesktop:centos_env -o "$IMAGE_TAR"
+          ls -lh "$IMAGE_TAR"
+
+      - name: Save centos_env image cache
+        if: steps.img-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.IMAGE_TAR }}
+          key: ${{ steps.img-cache.outputs.cache-primary-key }}
+
+      - name: Load cached centos_env image
+        if: steps.img-cache.outputs.cache-hit == 'true'
+        run: |
+          set -eux
+          docker load -i "$IMAGE_TAR"
+          docker image ls tdesktop:centos_env
+
+      - name: Reclaim space before compile
+        run: |
+          set -eux
+          sudo rm -f "$IMAGE_TAR"
+          df -h / /mnt
+
+      - name: Build Telegram
+        run: |
+          set -eux
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "$PWD:/usr/src/tdesktop" \
+            -e CONFIG="$CONFIG" \
+            tdesktop:centos_env \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D TDESKTOP_API_ID="$API_ID" \
+            -D TDESKTOP_API_HASH="$API_HASH"
+
+      - name: Locate and strip binary
+        id: bin
+        run: |
+          set -eux
+          bin="$(find out -type f -executable -name AyuGram | head -n1)"
+          if [ -z "$bin" ]; then
+            echo "AyuGram binary not found under out/" >&2
+            find out -maxdepth 4 -type f | head -50
+            exit 1
+          fi
+          ls -lh "$bin"
+          if [ "$CONFIG" = "Release" ]; then
+            strip "$bin"
+            ls -lh "$bin"
+          fi
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AyuGram-Linux-${{ env.CONFIG }}
+          path: ${{ steps.bin.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
